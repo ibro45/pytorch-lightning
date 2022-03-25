@@ -166,3 +166,39 @@ class IndexBatchSamplerWrapper:
     @property
     def sampler(self) -> Sampler:
         return self._sampler.sampler
+
+
+class DistributedSamplerProxy(DistributedSampler):
+    """Turn an existing, non-distributed, sampler into a distributed one.
+    Taken from https://github.com/pytorch/pytorch/issues/23430#issuecomment-1038032217"""
+    def __iter__(self):
+        indices = list(self.dataset)[:self.total_size]
+
+        # add extra samples to make it evenly divisible
+        indices += indices[:(self.total_size - len(indices))]
+        assert len(indices) == self.total_size , f"{len(indices)} != {self.total_size}"
+
+        # subsample
+        offset = self.num_samples * self.rank
+        indices = indices[offset : offset + self.num_samples]
+        assert len(indices) == self.num_samples, f"{len(indices)} != {self.num_samples}"
+
+        return iter(indices)
+
+    def set_epoch(self, epoch):
+        super().set_epoch(epoch)
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch)
+        elif hasattr(self.dataset, 'generator'):
+            self.dataset.generator = torch.Generator().manual_seed(self.seed + epoch)
+
+    def state_dict(self):
+        return self.dataset.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.dataset.load_state_dict(state_dict)
+
+
+class UnrepeatedDistributedSamplerProxy(DistributedSamplerProxy):
+    def __init__(self):
+        raise NotImplementedError()

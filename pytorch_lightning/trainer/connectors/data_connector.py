@@ -22,7 +22,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 import pytorch_lightning as pl
 from pytorch_lightning.accelerators.ipu import IPUAccelerator
-from pytorch_lightning.overrides.distributed import UnrepeatedDistributedSampler
+from pytorch_lightning.overrides.distributed import (
+    UnrepeatedDistributedSampler,
+    DistributedSamplerProxy,
+    UnrepeatedDistributedSamplerProxy
+)
 from pytorch_lightning.strategies import DDPSpawnStrategy
 from pytorch_lightning.trainer.states import RunningStage, TrainerFn
 from pytorch_lightning.trainer.supporters import CombinedLoader, CycleIterator
@@ -265,7 +269,7 @@ class DataConnector:
         return (
             self.trainer._accelerator_connector.replace_sampler_ddp
             and self.trainer._accelerator_connector.is_distributed
-            and not isinstance(dataloader.sampler, DistributedSampler)
+            and not isinstance(dataloader.sampler, (DistributedSampler, DistributedSamplerProxy))
             and not has_iterable_dataset(dataloader)
             # `DistributedSampler` is never used with `poptorch.DataLoader`
             and not isinstance(self.trainer.accelerator, IPUAccelerator)
@@ -325,13 +329,6 @@ class DataConnector:
 
     def _resolve_sampler(self, dataloader: DataLoader, shuffle: bool, mode: Optional[RunningStage] = None) -> Sampler:
         if self._requires_distributed_sampler(dataloader):
-            if not isinstance(dataloader.sampler, (SequentialSampler, RandomSampler)):
-                raise MisconfigurationException(
-                    "You seem to have configured a sampler in your DataLoader. This will be replaced"
-                    " by `DistributedSampler` since `replace_sampler_ddp` is True and you are using"
-                    " distributed training. Either remove the sampler from your DataLoader or set"
-                    " `replace_sampler_ddp=False` if you want to use your custom sampler."
-                )
             sampler = self._get_distributed_sampler(
                 dataloader,
                 shuffle,
@@ -339,17 +336,17 @@ class DataConnector:
                 overfit_batches=self.trainer.overfit_batches,
                 **self.trainer.distributed_sampler_kwargs,
             )
-
             # update docs too once this is resolved
             trainer_fn = self.trainer.state.fn
-            if isinstance(sampler, DistributedSampler) and trainer_fn in (TrainerFn.VALIDATING, TrainerFn.TESTING):
-                rank_zero_warn(
-                    f"Using `DistributedSampler` with the dataloaders. During `trainer.{trainer_fn.value}()`,"
-                    " it is recommended to use `Trainer(devices=1)` to ensure each sample/batch gets evaluated"
-                    " exactly once. Otherwise, multi-device settings use `DistributedSampler` that replicates"
-                    " some samples to make sure all devices have same batch size in case of uneven inputs.",
-                    category=PossibleUserWarning,
-                )
+            if isinstance(sampler, (DistributedSampler, DistributedSamplerProxy)):
+                if trainer_fn in (TrainerFn.VALIDATING, TrainerFn.TESTING):
+                    rank_zero_warn(
+                        f"Using `DistributedSampler` with the dataloaders. During `trainer.{trainer_fn.value}()`,"
+                        " it is recommended to use `Trainer(devices=1)` to ensure each sample/batch gets evaluated"
+                        " exactly once. Otherwise, multi-device settings use `DistributedSampler` that replicates"
+                        " some samples to make sure all devices have same batch size in case of uneven inputs.",
+                        category=PossibleUserWarning,
+                    )
 
             return sampler
 
@@ -362,12 +359,16 @@ class DataConnector:
         overfit_batches: Union[int, float],
         mode: Optional[RunningStage] = None,
         **kwargs: Any,
-    ) -> DistributedSampler:
+    ) -> Union[DistributedSampler, DistributedSamplerProxy]:
         """This function is used to created the distributed sampler injected within the user DataLoader."""
         kwargs["shuffle"] = shuffle and not overfit_batches
         kwargs.setdefault("seed", int(os.getenv("PL_GLOBAL_SEED", 0)))
-        cls = UnrepeatedDistributedSampler if mode == RunningStage.PREDICTING else DistributedSampler
-        sampler = cls(dataloader.dataset, **kwargs)
+        if dataloader.sampler is None :
+            cls = UnrepeatedDistributedSampler if mode == RunningStage.PREDICTING else DistributedSampler
+            sampler = cls(dataloader.dataset, **kwargs)
+        else:
+            cls = UnrepeatedDistributedSamplerProxy if mode == RunningStage.PREDICTING else DistributedSamplerProxy
+            sampler = cls(dataloader.sampler, **kwargs)
         return sampler
 
     def _reset_eval_dataloader(
